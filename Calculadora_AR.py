@@ -10,24 +10,24 @@ from dataclasses import dataclass, asdict
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # =============================================================================
-# CLASSE PIECE (Representa uma peça a ser posicionada)
+# CLASSE PIECE – Representa uma peça a ser posicionada
 # =============================================================================
 @dataclass
 class Piece:
-    # Para peças retangulares: use width, height e section;
-    # Para peças circulares: use diameter e inner_diameter.
+    # Para peças retangulares: use width, height e section.
+    # Para peças circulares: use diameter (DE) e inner_diameter (DI).
     shape: str             # "rectangular" ou "circular"
-    width: float = None    # Largura (para retangular)
-    height: float = None   # Comprimento (para retangular)
-    section: float = 0     # Seção (para retangular; 0 se peça sólida)
-    diameter: float = None # DE (para circular)
-    inner_diameter: float = 0  # DI (para circular; 0 para peça sólida)
+    width: float = None    # para peças retangulares
+    height: float = None   # para peças retangulares
+    section: float = 0     # para peças retangulares; se em branco, assume 0 (peça sólida)
+    diameter: float = None # para peças circulares (DE)
+    inner_diameter: float = 0  # para peças circulares (DI); se 0, peça sólida
     quantity: int = 1
     rotatable: bool = True
     max_mode: bool = False
 
 # =============================================================================
-# CLASSE LAYOUTSHEET (Representa uma chapa única)
+# CLASSE LAYOUTSHEET – Representa uma chapa única
 # =============================================================================
 class LayoutSheet:
     def __init__(self, width: float, length: float):
@@ -37,7 +37,6 @@ class LayoutSheet:
         logging.info(f"Nova chapa criada: {self.width} x {self.length} mm")
 
     def check_and_mark_rectangular(self, x: int, y: int, w: int, h: int, extra: int) -> bool:
-        """Verifica se a região está livre e, se sim, marca a área ocupada."""
         if extra <= 0 or (extra * 2 >= w) or (extra * 2 >= h):
             region = self.layout[y:y+h, x:x+w]
             if np.all(region == 0):
@@ -60,15 +59,15 @@ class LayoutSheet:
                 return False
 
     def try_place_rectangular(self, piece_width: int, piece_height: int, extra: int, margin: int):
-        step_x = int(margin + piece_width)
-        step_y = int(margin + piece_height)
+        step = max(1, int(margin + piece_width))
+        step_y = max(1, int(margin + piece_height))
         # Varredura linha-primeiro
         for y in range(0, self.length - piece_height + 1, step_y):
-            for x in range(0, self.width - piece_width + 1, step_x):
+            for x in range(0, self.width - piece_width + 1, step):
                 if self.check_and_mark_rectangular(x, y, piece_width, piece_height, extra):
                     return (x, y)
         # Varredura coluna-primeiro
-        for x in range(0, self.width - piece_width + 1, step_x):
+        for x in range(0, self.width - piece_width + 1, step):
             for y in range(0, self.length - piece_height + 1, step_y):
                 if self.check_and_mark_rectangular(x, y, piece_width, piece_height, extra):
                     return (x, y)
@@ -114,24 +113,33 @@ class LayoutSheet:
             return False
 
     def try_place_circular(self, diameter: int, inner_diameter: float, margin: int):
-        step = int(margin + diameter)
+        # Se for peça vazada, utiliza step menor para detectar espaços internos livres
+        if inner_diameter > 0:
+            step = max(1, int(margin))
+        else:
+            step = max(1, int(margin + diameter))
         for y in range(0, self.length - diameter + 1, step):
             for x in range(0, self.width - diameter + 1, step):
+                if self.check_and_mark_circular(x, y, diameter, inner_diameter):
+                    return (x, y)
+        # Busca completa, se não encontrada com step otimizado
+        for y in range(0, self.length - diameter + 1):
+            for x in range(0, self.width - diameter + 1):
                 if self.check_and_mark_circular(x, y, diameter, inner_diameter):
                     return (x, y)
         return None
 
 # =============================================================================
-# CLASSE CUTOPTIMIZER (Responsável pela otimização dos cortes em uma ou mais chapas)
+# CLASSE CUTOPTIMIZER – Responsável pela otimização dos cortes
 # =============================================================================
 class CutOptimizer:
     def __init__(self, sheet_width: float, sheet_length: float, margin: float):
         self.sheet_width = sheet_width
         self.sheet_length = sheet_length
         self.margin = margin
-        self.sheets = []  # Lista de objetos LayoutSheet
+        self.sheets = []
         self.sheets.append(LayoutSheet(sheet_width, sheet_length))
-        self.positions = []  # Lista com os posicionamentos das peças
+        self.positions = []
         self.total_pieces = 0
 
     def _get_current_sheet(self):
@@ -143,61 +151,15 @@ class CutOptimizer:
         logging.info(f"Nova chapa adicionada. Total de chapas: {len(self.sheets)}")
 
     def optimize(self, pieces: list, progress_callback=None):
-        """
-        Executa a otimização.
-        :param pieces: Lista de objetos Piece.
-        :param progress_callback: Função para atualizar o progresso (valor entre 0 e 1).
-        :return: (positions, total_pieces, number_of_sheets)
-        """
-        # Cálculo aproximado do total de peças para a barra de progresso
-        total_count = sum(p.quantity if not p.max_mode else 1 for p in pieces)
+        # Para o progresso, considera-se 1 "tentativa" para max_mode e quantidade para os demais.
+        total_count = sum(piece.quantity if not piece.max_mode else 1 for piece in pieces)
         progress = 0
-
         for piece in pieces:
-            for _ in range(piece.quantity if not piece.max_mode else 1):
-                placed = False
-                current_sheet = self._get_current_sheet()
-                if piece.shape == "rectangular":
-                    # Tenta orientação normal e, se permitido, rotacionada
-                    pos = current_sheet.try_place_rectangular(int(piece.width), int(piece.height), int(piece.section), int(self.margin))
-                    orientation = "normal"
-                    if pos is None and piece.rotatable:
-                        pos = current_sheet.try_place_rectangular(int(piece.height), int(piece.width), int(piece.section), int(self.margin))
-                        orientation = "rotated" if pos is not None else None
-                    if pos is not None:
-                        self.positions.append({
-                            "sheet": len(self.sheets),
-                            "x": pos[0],
-                            "y": pos[1],
-                            "width": piece.width if orientation == "normal" else piece.height,
-                            "height": piece.height if orientation == "normal" else piece.width,
-                            "shape": "rectangular",
-                            "section": piece.section,
-                            "orientation": orientation
-                        })
-                        self.total_pieces += 1
-                        placed = True
-                        logging.info(f"Peça retangular posicionada na chapa {len(self.sheets)} em {pos} com orientação {orientation}")
-                elif piece.shape == "circular":
-                    pos = current_sheet.try_place_circular(int(piece.diameter), piece.inner_diameter, int(self.margin))
-                    if pos is not None:
-                        self.positions.append({
-                            "sheet": len(self.sheets),
-                            "x": pos[0],
-                            "y": pos[1],
-                            "diameter": piece.diameter,
-                            "inner_diameter": piece.inner_diameter,
-                            "shape": "circular",
-                            "orientation": "normal"
-                        })
-                        self.total_pieces += 1
-                        placed = True
-                        logging.info(f"Peça circular posicionada na chapa {len(self.sheets)} em {pos}")
-
-                if not placed:
-                    # Se não couber na chapa atual, cria uma nova e tenta novamente
-                    self._add_new_sheet()
+            if piece.max_mode:
+                # Preenche somente a chapa atual com o máximo possível desta peça
+                while True:
                     current_sheet = self._get_current_sheet()
+                    placed = False
                     if piece.shape == "rectangular":
                         pos = current_sheet.try_place_rectangular(int(piece.width), int(piece.height), int(piece.section), int(self.margin))
                         orientation = "normal"
@@ -216,6 +178,8 @@ class CutOptimizer:
                                 "orientation": orientation
                             })
                             self.total_pieces += 1
+                            placed = True
+                            logging.info(f"Peça retangular (max_mode) posicionada na chapa {len(self.sheets)} em {pos} com orientação {orientation}")
                     elif piece.shape == "circular":
                         pos = current_sheet.try_place_circular(int(piece.diameter), piece.inner_diameter, int(self.margin))
                         if pos is not None:
@@ -229,9 +193,61 @@ class CutOptimizer:
                                 "orientation": "normal"
                             })
                             self.total_pieces += 1
-                progress += 1
-                if progress_callback:
-                    progress_callback(min(progress / total_count, 1.0))
+                            placed = True
+                            logging.info(f"Peça circular (max_mode) posicionada na chapa {len(self.sheets)} em {pos}")
+                    if not placed:
+                        # Se não couber mais na chapa atual, encerra max_mode (não cria nova chapa para max_mode)
+                        break
+                    progress += 1
+                    if progress_callback:
+                        progress_callback(min(progress / total_count, 1.0))
+            else:
+                for _ in range(piece.quantity):
+                    placed = False
+                    while not placed:
+                        current_sheet = self._get_current_sheet()
+                        if piece.shape == "rectangular":
+                            pos = current_sheet.try_place_rectangular(int(piece.width), int(piece.height), int(piece.section), int(self.margin))
+                            orientation = "normal"
+                            if pos is None and piece.rotatable:
+                                pos = current_sheet.try_place_rectangular(int(piece.height), int(piece.width), int(piece.section), int(self.margin))
+                                orientation = "rotated" if pos is not None else None
+                            if pos is not None:
+                                self.positions.append({
+                                    "sheet": len(self.sheets),
+                                    "x": pos[0],
+                                    "y": pos[1],
+                                    "width": piece.width if orientation == "normal" else piece.height,
+                                    "height": piece.height if orientation == "normal" else piece.width,
+                                    "shape": "rectangular",
+                                    "section": piece.section,
+                                    "orientation": orientation
+                                })
+                                self.total_pieces += 1
+                                placed = True
+                                logging.info(f"Peça retangular posicionada na chapa {len(self.sheets)} em {pos} com orientação {orientation}")
+                            else:
+                                self._add_new_sheet()
+                        elif piece.shape == "circular":
+                            pos = current_sheet.try_place_circular(int(piece.diameter), piece.inner_diameter, int(self.margin))
+                            if pos is not None:
+                                self.positions.append({
+                                    "sheet": len(self.sheets),
+                                    "x": pos[0],
+                                    "y": pos[1],
+                                    "diameter": piece.diameter,
+                                    "inner_diameter": piece.inner_diameter,
+                                    "shape": "circular",
+                                    "orientation": "normal"
+                                })
+                                self.total_pieces += 1
+                                placed = True
+                                logging.info(f"Peça circular posicionada na chapa {len(self.sheets)} em {pos}")
+                            else:
+                                self._add_new_sheet()
+                    progress += 1
+                    if progress_callback:
+                        progress_callback(min(progress / total_count, 1.0))
         return self.positions, self.total_pieces, len(self.sheets)
 
 # =============================================================================
@@ -290,17 +306,29 @@ def main():
     st.title("Sistema de Otimização de Corte")
     st.write("Interface moderna com Streamlit e lógica desacoplada para facilitar futuras migrações.")
 
-    # Inicializa a lista de peças na session state (para manter os dados entre interações)
+    # Inicializa a lista de peças na session_state (mantendo os dados entre interações)
     if "pieces" not in st.session_state:
         st.session_state["pieces"] = []
 
-    # Escolha do modo de inserção
+    # Seleção do modo de inserção: Manual ou Excel
     mode = st.sidebar.radio("Selecione o modo de inserção de peças", ("Manual", "Excel"))
 
-    # Botão para limpar a lista de peças (caso deseje reiniciar)
+    # Botão para limpar a lista de peças
     if st.sidebar.button("Limpar lista de peças"):
         st.session_state["pieces"] = []
         st.sidebar.success("Lista de peças limpa.")
+
+    # Opção para excluir peça
+    if st.session_state["pieces"]:
+        st.sidebar.subheader("Excluir Peça")
+        pieces_str = [f"{i}: " +
+                      (f"Retangular: {p.width}x{p.height} mm, Seção: {p.section}, Qtd: {p.quantity}" if p.shape == "rectangular"
+                       else f"Circular: DE {p.diameter} mm, DI {p.inner_diameter} mm, Qtd: {p.quantity}")
+                      for i, p in enumerate(st.session_state["pieces"])]
+        selected_index = st.sidebar.selectbox("Selecione a peça para excluir", options=range(len(pieces_str)), format_func=lambda i: pieces_str[i])
+        if st.sidebar.button("Excluir Peça"):
+            st.session_state["pieces"].pop(selected_index)
+            st.sidebar.success("Peça excluída com sucesso!")
 
     # =============================================================================
     # MODO MANUAL
@@ -311,7 +339,7 @@ def main():
         if piece_type == "Retangular":
             width = st.sidebar.text_input("Largura (mm)", value="50", key="width")
             height = st.sidebar.text_input("Comprimento (mm)", value="80", key="height")
-            section = st.sidebar.text_input("Seção (mm)", value="5", key="section")
+            section = st.sidebar.text_input("Seção (mm) [opcional, deixe em branco para peça sólida]", value="5", key="section")
             quantity = st.sidebar.text_input("Quantidade", value="1", key="quantity_rect")
             rotatable = st.sidebar.checkbox("Permitir Rotação", value=True, key="rotatable")
             max_mode = st.sidebar.checkbox("Calcular máximo na chapa", value=False, key="max_mode_rect")
@@ -319,7 +347,7 @@ def main():
                 try:
                     w_val = float(width)
                     h_val = float(height)
-                    sec_val = float(section)
+                    sec_val = float(section) if section.strip() != "" else 0
                     qty_val = int(quantity) if quantity.strip() != "" else 1
                     new_piece = Piece(
                         shape="rectangular",
@@ -337,7 +365,7 @@ def main():
                     st.sidebar.error(f"Erro na entrada de dados da peça retangular: {e}")
         else:
             diameter = st.sidebar.text_input("DE (mm)", value="60", key="diameter")
-            inner_diameter = st.sidebar.text_input("DI (mm)", value="0", key="inner_diameter")
+            inner_diameter = st.sidebar.text_input("DI (mm) [opcional, deixe em branco para peça sólida]", value="0", key="inner_diameter")
             quantity = st.sidebar.text_input("Quantidade", value="1", key="quantity_circ")
             max_mode = st.sidebar.checkbox("Calcular máximo na chapa", value=False, key="max_mode_circ")
             if st.sidebar.button("Adicionar Peça Circular"):
@@ -350,7 +378,7 @@ def main():
                         diameter=d_val,
                         inner_diameter=inner_val,
                         quantity=qty_val,
-                        rotatable=True,  # Para peças circulares, sempre true
+                        rotatable=True,
                         max_mode=max_mode
                     )
                     st.session_state["pieces"].append(new_piece)
@@ -358,7 +386,6 @@ def main():
                     logging.info(f"Peça circular adicionada: {asdict(new_piece)}")
                 except ValueError as e:
                     st.sidebar.error(f"Erro na entrada de dados da peça circular: {e}")
-
     # =============================================================================
     # MODO EXCEL
     # =============================================================================
@@ -374,7 +401,6 @@ def main():
                 if not required_columns.issubset(set(df.columns)):
                     st.sidebar.error(f"O arquivo deve conter as colunas: {', '.join(required_columns)}")
                 else:
-                    # Limpa a lista de peças antes de importar
                     st.session_state["pieces"] = []
                     for idx, row in df.iterrows():
                         formato = str(row.get("Formato", "")).strip().capitalize()
@@ -388,7 +414,7 @@ def main():
                             try:
                                 w_val = float(row.get("L", ""))
                                 h_val = float(row.get("C", ""))
-                                sec_val = float(row.get("S", "0"))
+                                sec_val = float(row.get("S", "0")) if str(row.get("S", "")).strip() != "" else 0
                                 new_piece = Piece(
                                     shape="rectangular",
                                     width=w_val,
@@ -404,7 +430,7 @@ def main():
                         elif formato.lower().startswith("cir"):
                             try:
                                 d_val = float(row.get("L", ""))
-                                inner_val = float(row.get("C", "0"))
+                                inner_val = float(row.get("C", "0")) if str(row.get("C", "")).strip() != "" else 0
                                 new_piece = Piece(
                                     shape="circular",
                                     diameter=d_val,
@@ -421,7 +447,7 @@ def main():
             except Exception as e:
                 st.sidebar.error(f"Erro ao ler o arquivo Excel: {e}")
 
-    # Exibe a lista de peças adicionadas (se houver)
+    # Exibe a lista de peças cadastradas
     if st.session_state["pieces"]:
         st.subheader("Peças Cadastradas")
         df_pieces = pd.DataFrame([asdict(p) for p in st.session_state["pieces"]])
@@ -452,7 +478,6 @@ def main():
             st.error("Nenhuma peça cadastrada. Adicione peças manualmente ou via Excel.")
             return
 
-        # Exibe barra de progresso
         progress_bar = st.progress(0)
         def update_progress(prog):
             progress_bar.progress(min(int(prog * 100), 100))
