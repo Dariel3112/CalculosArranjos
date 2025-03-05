@@ -25,6 +25,17 @@ class Piece:
     rotatable: bool = True
     max_mode: bool = False
 
+    @property
+    def bounding_area(self) -> float:
+        """
+        Retorna a área de bounding box para a peça,
+        usada para ordenação (largest-first).
+        """
+        if self.shape == "rectangular":
+            return self.width * self.height
+        else:
+            return self.diameter ** 2
+
 # =============================================================================
 # CLASSE LAYOUTSHEET – Representa uma chapa única
 # =============================================================================
@@ -136,7 +147,6 @@ class LayoutSheet:
                     return (x, y)
 
         # Se não encontrou com a varredura heurística, faz uma busca final completa
-        # (ainda vetorizada, mas sem saltos). Isso garante não perder casos de encaixe apertado.
         for y in range(0, self.length - diameter + 1):
             for x in range(0, self.width - diameter + 1):
                 if self.check_and_mark_circular(x, y, diameter, inner_diameter):
@@ -167,122 +177,177 @@ class CutOptimizer:
 
     def optimize(self, pieces: list, progress_callback=None):
         """
-        Executa a otimização de corte. A cada peça, tenta colocá-la na chapa atual.
-        Se não couber, cria uma nova chapa (exceto em modo max_mode, que para ao encher a chapa).
+        Executa a otimização de corte em duas etapas:
+          1. Ordena as peças "normais" (quantity > 0, max_mode=False) da maior bounding_area para a menor
+             e as replica de acordo com quantity.
+          2. Ordena as peças em max_mode pela maior bounding_area primeiro e preenche as chapas em modo 'while'.
+
+        Para cada peça, usa a abordagem "First Fit" – tenta colocar na última chapa;
+        se não couber, cria nova (exceto no max_mode, que preenche apenas a chapa atual).
         """
-        # Para o progresso, considera-se 1 "tentativa" para max_mode e quantity para os demais.
-        total_count = sum(piece.quantity if not piece.max_mode else 1 for piece in pieces)
+        # Separa peças max_mode das demais
+        normal_pieces = []
+        maxmode_pieces = []
+        for p in pieces:
+            if p.max_mode:
+                maxmode_pieces.append(p)
+            else:
+                normal_pieces.append(p)
+
+        # 1) Expande e ordena as peças normais por bounding_area (maior -> menor)
+        expanded_normal = []
+        for p in normal_pieces:
+            for _ in range(p.quantity):
+                expanded_normal.append(p)
+
+        expanded_normal.sort(key=lambda x: x.bounding_area, reverse=True)
+
+        # 2) Ordena as peças max_mode por bounding_area (maior -> menor)
+        maxmode_pieces.sort(key=lambda x: x.bounding_area, reverse=True)
+
+        # Soma total de "tentativas" para barra de progresso
+        total_count = len(expanded_normal) + len(maxmode_pieces)
         progress = 0
 
-        for piece in pieces:
-            if piece.max_mode:
-                # Preenche somente a chapa atual com o máximo possível desta peça
-                while True:
-                    current_sheet = self._get_current_sheet()
-                    placed = False
-                    if piece.shape == "rectangular":
-                        pos = current_sheet.try_place_rectangular(int(piece.width), int(piece.height),
-                                                                  int(piece.section), int(self.margin))
-                        orientation = "normal"
-                        if pos is None and piece.rotatable:
-                            pos = current_sheet.try_place_rectangular(int(piece.height), int(piece.width),
-                                                                      int(piece.section), int(self.margin))
-                            orientation = "rotated" if pos is not None else None
+        # --------------------------------------------------------------------
+        # Primeiro, aloca as peças normais (que foram expandidas e ordenadas)
+        # --------------------------------------------------------------------
+        for piece in expanded_normal:
+            placed = False
+            while not placed:
+                current_sheet = self._get_current_sheet()
+                if piece.shape == "rectangular":
+                    pos = current_sheet.try_place_rectangular(
+                        int(piece.width),
+                        int(piece.height),
+                        int(piece.section),
+                        int(self.margin)
+                    )
+                    orientation = "normal"
+                    if pos is None and piece.rotatable:
+                        pos = current_sheet.try_place_rectangular(
+                            int(piece.height),
+                            int(piece.width),
+                            int(piece.section),
+                            int(self.margin)
+                        )
+                        orientation = "rotated" if pos is not None else None
 
-                        if pos is not None:
-                            self.positions.append({
-                                "sheet": len(self.sheets),
-                                "x": pos[0],
-                                "y": pos[1],
-                                "width": piece.width if orientation == "normal" else piece.height,
-                                "height": piece.height if orientation == "normal" else piece.width,
-                                "shape": "rectangular",
-                                "section": piece.section,
-                                "orientation": orientation
-                            })
-                            self.total_pieces += 1
-                            placed = True
-                            logging.info(f"Peça retangular (max_mode) posicionada na chapa {len(self.sheets)} em {pos} com orientação {orientation}")
+                    if pos is not None:
+                        self.positions.append({
+                            "sheet": len(self.sheets),
+                            "x": pos[0],
+                            "y": pos[1],
+                            "width": piece.width if orientation == "normal" else piece.height,
+                            "height": piece.height if orientation == "normal" else piece.width,
+                            "shape": "rectangular",
+                            "section": piece.section,
+                            "orientation": orientation
+                        })
+                        self.total_pieces += 1
+                        placed = True
+                        logging.info(f"Peça retangular posicionada na chapa {len(self.sheets)} em {pos} com orientação {orientation}")
                     else:
-                        # Circular
-                        pos = current_sheet.try_place_circular(int(piece.diameter), piece.inner_diameter, int(self.margin))
-                        if pos is not None:
-                            self.positions.append({
-                                "sheet": len(self.sheets),
-                                "x": pos[0],
-                                "y": pos[1],
-                                "diameter": piece.diameter,
-                                "inner_diameter": piece.inner_diameter,
-                                "shape": "circular",
-                                "orientation": "normal"
-                            })
-                            self.total_pieces += 1
-                            placed = True
-                            logging.info(f"Peça circular (max_mode) posicionada na chapa {len(self.sheets)} em {pos}")
+                        self._add_new_sheet()
 
-                    if not placed:
-                        # Se não couber mais na chapa atual, encerra max_mode (não cria nova chapa para max_mode)
-                        break
-                    progress += 1
-                    if progress_callback:
-                        progress_callback(min(progress / total_count, 1.0))
+                else:
+                    # Circular
+                    pos = current_sheet.try_place_circular(
+                        int(piece.diameter),
+                        piece.inner_diameter,
+                        int(self.margin)
+                    )
+                    if pos is not None:
+                        self.positions.append({
+                            "sheet": len(self.sheets),
+                            "x": pos[0],
+                            "y": pos[1],
+                            "diameter": piece.diameter,
+                            "inner_diameter": piece.inner_diameter,
+                            "shape": "circular",
+                            "orientation": "normal"
+                        })
+                        self.total_pieces += 1
+                        placed = True
+                        logging.info(f"Peça circular posicionada na chapa {len(self.sheets)} em {pos}")
+                    else:
+                        self._add_new_sheet()
 
-            else:
-                # Modo "normal": respeita a quantidade de peças
-                for _ in range(piece.quantity):
-                    placed = False
-                    while not placed:
-                        current_sheet = self._get_current_sheet()
-                        if piece.shape == "rectangular":
-                            pos = current_sheet.try_place_rectangular(int(piece.width), int(piece.height),
-                                                                      int(piece.section), int(self.margin))
-                            orientation = "normal"
-                            if pos is None and piece.rotatable:
-                                pos = current_sheet.try_place_rectangular(int(piece.height), int(piece.width),
-                                                                          int(piece.section), int(self.margin))
-                                orientation = "rotated" if pos is not None else None
+            progress += 1
+            if progress_callback:
+                progress_callback(min(progress / total_count, 1.0))
 
-                            if pos is not None:
-                                self.positions.append({
-                                    "sheet": len(self.sheets),
-                                    "x": pos[0],
-                                    "y": pos[1],
-                                    "width": piece.width if orientation == "normal" else piece.height,
-                                    "height": piece.height if orientation == "normal" else piece.width,
-                                    "shape": "rectangular",
-                                    "section": piece.section,
-                                    "orientation": orientation
-                                })
-                                self.total_pieces += 1
-                                placed = True
-                                logging.info(f"Peça retangular posicionada na chapa {len(self.sheets)} em {pos} com orientação {orientation}")
-                            else:
-                                # Se não couber, cria nova chapa
-                                self._add_new_sheet()
+        # --------------------------------------------------------------------
+        # Depois, processa as peças em modo max_mode
+        # --------------------------------------------------------------------
+        for piece in maxmode_pieces:
+            # Cada peça max_mode é inserida quantas vezes couber na chapa atual
+            # (uma única "tentativa" de encher a chapa)
+            # e então passamos para a próxima peça.
+            current_sheet = self._get_current_sheet()
+            placed_any = False
+            while True:
+                placed = False
+                if piece.shape == "rectangular":
+                    pos = current_sheet.try_place_rectangular(
+                        int(piece.width),
+                        int(piece.height),
+                        int(piece.section),
+                        int(self.margin)
+                    )
+                    orientation = "normal"
+                    if pos is None and piece.rotatable:
+                        pos = current_sheet.try_place_rectangular(
+                            int(piece.height),
+                            int(piece.width),
+                            int(piece.section),
+                            int(self.margin)
+                        )
+                        orientation = "rotated" if pos is not None else None
 
-                        else:
-                            # Circular
-                            pos = current_sheet.try_place_circular(int(piece.diameter), piece.inner_diameter, int(self.margin))
-                            if pos is not None:
-                                self.positions.append({
-                                    "sheet": len(self.sheets),
-                                    "x": pos[0],
-                                    "y": pos[1],
-                                    "diameter": piece.diameter,
-                                    "inner_diameter": piece.inner_diameter,
-                                    "shape": "circular",
-                                    "orientation": "normal"
-                                })
-                                self.total_pieces += 1
-                                placed = True
-                                logging.info(f"Peça circular posicionada na chapa {len(self.sheets)} em {pos}")
-                            else:
-                                # Se não couber, cria nova chapa
-                                self._add_new_sheet()
+                    if pos is not None:
+                        self.positions.append({
+                            "sheet": len(self.sheets),
+                            "x": pos[0],
+                            "y": pos[1],
+                            "width": piece.width if orientation == "normal" else piece.height,
+                            "height": piece.height if orientation == "normal" else piece.width,
+                            "shape": "rectangular",
+                            "section": piece.section,
+                            "orientation": orientation
+                        })
+                        self.total_pieces += 1
+                        placed = True
+                        placed_any = True
+                        logging.info(f"Peça retangular (max_mode) posicionada na chapa {len(self.sheets)} em {pos} com orientação {orientation}")
+                else:
+                    pos = current_sheet.try_place_circular(
+                        int(piece.diameter),
+                        piece.inner_diameter,
+                        int(self.margin)
+                    )
+                    if pos is not None:
+                        self.positions.append({
+                            "sheet": len(self.sheets),
+                            "x": pos[0],
+                            "y": pos[1],
+                            "diameter": piece.diameter,
+                            "inner_diameter": piece.inner_diameter,
+                            "shape": "circular",
+                            "orientation": "normal"
+                        })
+                        self.total_pieces += 1
+                        placed = True
+                        placed_any = True
+                        logging.info(f"Peça circular (max_mode) posicionada na chapa {len(self.sheets)} em {pos}")
 
-                    progress += 1
-                    if progress_callback:
-                        progress_callback(min(progress / total_count, 1.0))
+                if not placed:
+                    # Se não couber mais na chapa atual, não cria nova para max_mode.
+                    break
+
+            progress += 1
+            if progress_callback:
+                progress_callback(min(progress / total_count, 1.0))
 
         return self.positions, self.total_pieces, len(self.sheets)
 
