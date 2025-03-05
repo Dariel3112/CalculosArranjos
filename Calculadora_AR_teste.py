@@ -36,6 +36,10 @@ class LayoutSheet:
         logging.info(f"Nova chapa criada: {self.width} x {self.length} mm")
 
     def check_and_mark_rectangular(self, x: int, y: int, w: int, h: int, extra: int) -> bool:
+        """
+        Verifica e marca uma peça retangular (ou vazada) de dimensões (w x h).
+        Usa slicing do NumPy para detectar se a área está livre.
+        """
         if extra <= 0 or (extra * 2 >= w) or (extra * 2 >= h):
             region = self.layout[y:y+h, x:x+w]
             if np.all(region == 0):
@@ -58,74 +62,86 @@ class LayoutSheet:
                 return False
 
     def try_place_rectangular(self, piece_width: int, piece_height: int, extra: int, margin: int):
-        step = max(1, int(margin + piece_width))
+        """
+        Busca posição livre na chapa para a peça retangular, varrendo em passos (linha e coluna).
+        """
+        step_x = max(1, int(margin + piece_width))
         step_y = max(1, int(margin + piece_height))
         # Varredura linha-primeiro
         for y in range(0, self.length - piece_height + 1, step_y):
-            for x in range(0, self.width - piece_width + 1, step):
+            for x in range(0, self.width - piece_width + 1, step_x):
                 if self.check_and_mark_rectangular(x, y, piece_width, piece_height, extra):
                     return (x, y)
         # Varredura coluna-primeiro
-        for x in range(0, self.width - piece_width + 1, step):
+        for x in range(0, self.width - piece_width + 1, step_x):
             for y in range(0, self.length - piece_height + 1, step_y):
                 if self.check_and_mark_rectangular(x, y, piece_width, piece_height, extra):
                     return (x, y)
         return None
 
     def check_and_mark_circular(self, x: int, y: int, diameter: int, inner_diameter: float) -> bool:
-        outer_radius = diameter / 2.0
-        inner_radius = inner_diameter / 2.0
-        cx = x + outer_radius
-        cy = y + outer_radius
-        free = True
-        for i in range(y, y + diameter):
-            for j in range(x, x + diameter):
-                cell_center_x = j + 0.5
-                cell_center_y = i + 0.5
-                dist = math.hypot(cell_center_x - cx, cell_center_y - cy)
-                if inner_diameter > 0:
-                    if (dist <= outer_radius) and (dist >= inner_radius):
-                        if self.layout[i, j] != 0:
-                            free = False
-                            break
-                else:
-                    if dist <= outer_radius:
-                        if self.layout[i, j] != 0:
-                            free = False
-                            break
-            if not free:
-                break
-        if free:
-            for i in range(y, y + diameter):
-                for j in range(x, x + diameter):
-                    cell_center_x = j + 0.5
-                    cell_center_y = i + 0.5
-                    dist = math.hypot(cell_center_x - cx, cell_center_y - cy)
-                    if inner_diameter > 0:
-                        if (dist <= outer_radius) and (dist >= inner_radius):
-                            self.layout[i, j] = 1
-                    else:
-                        if dist <= outer_radius:
-                            self.layout[i, j] = 1
-            return True
-        else:
+        """
+        Verifica e marca uma peça circular (ou anelar) de diâmetro externo 'diameter'
+        e diâmetro interno 'inner_diameter'. Implementado de forma vetorizada
+        para melhorar a performance em peças grandes.
+        """
+        # Se ultrapassar as bordas da chapa, retorna False imediatamente
+        if x + diameter > self.width or y + diameter > self.length:
             return False
 
-    def try_place_circular(self, diameter: int, inner_diameter: float, margin: int):
-        # Se for peça vazada, utiliza step menor para detectar espaços internos livres
-        if inner_diameter > 0:
-            step = max(1, int(margin))
+        outer_radius = diameter / 2.0
+        inner_radius = inner_diameter / 2.0
+
+        # "Recorta" a região da chapa onde a peça seria colocada
+        region = self.layout[y:y+diameter, x:x+diameter]
+
+        # Cria índices para todas as posições [0..diameter-1, 0..diameter-1]
+        idx = np.indices((diameter, diameter), dtype=float)
+        # Calcula a distância de cada ponto ao centro da peça (outer_radius, outer_radius)
+        dist = np.hypot((idx[0] + 0.5) - outer_radius, (idx[1] + 0.5) - outer_radius)
+
+        if inner_radius > 0:
+            # Máscara booleana para região anelar
+            mask = (dist <= outer_radius) & (dist >= inner_radius)
         else:
-            step = max(1, int(margin + diameter))
+            # Máscara booleana para região sólida
+            mask = (dist <= outer_radius)
+
+        # Verifica se todos os pontos onde mask=True estão livres (== 0)
+        if not np.all(region[mask] == 0):
+            return False
+
+        # Marca a região na chapa
+        region[mask] = 1
+        return True
+
+    def try_place_circular(self, diameter: int, inner_diameter: float, margin: int):
+        """
+        Busca posição livre na chapa para a peça circular, varrendo em passos.
+        A varredura é reduzida para melhorar performance, mas ainda
+        mantém a lógica de verificação.
+        """
+        # Heurística: se a peça é vazada (inner_diameter > 0), ou a margem é pequena,
+        # reduzimos o passo para permitir encontrar espaços internos.
+        # Caso contrário, usamos algo maior que a soma da margem + parte do diâmetro.
+        if inner_diameter > 0:
+            step = max(1, int(margin))  # busca mais fina para achar espaços internos
+        else:
+            # Usa 25% do diâmetro como passo adicional, evitando varreduras muito densas
+            step = max(1, int(margin + diameter * 0.25))
+
         for y in range(0, self.length - diameter + 1, step):
             for x in range(0, self.width - diameter + 1, step):
                 if self.check_and_mark_circular(x, y, diameter, inner_diameter):
                     return (x, y)
-        # Busca completa, se não encontrada com step otimizado
+
+        # Se não encontrou com a varredura heurística, faz uma busca final completa
+        # (ainda vetorizada, mas sem saltos). Isso garante não perder casos de encaixe apertado.
         for y in range(0, self.length - diameter + 1):
             for x in range(0, self.width - diameter + 1):
                 if self.check_and_mark_circular(x, y, diameter, inner_diameter):
                     return (x, y)
+
         return None
 
 # =============================================================================
@@ -150,9 +166,14 @@ class CutOptimizer:
         logging.info(f"Nova chapa adicionada. Total de chapas: {len(self.sheets)}")
 
     def optimize(self, pieces: list, progress_callback=None):
-        # Para o progresso, considera-se 1 "tentativa" para max_mode e quantidade para os demais.
+        """
+        Executa a otimização de corte. A cada peça, tenta colocá-la na chapa atual.
+        Se não couber, cria uma nova chapa (exceto em modo max_mode, que para ao encher a chapa).
+        """
+        # Para o progresso, considera-se 1 "tentativa" para max_mode e quantity para os demais.
         total_count = sum(piece.quantity if not piece.max_mode else 1 for piece in pieces)
         progress = 0
+
         for piece in pieces:
             if piece.max_mode:
                 # Preenche somente a chapa atual com o máximo possível desta peça
@@ -160,11 +181,14 @@ class CutOptimizer:
                     current_sheet = self._get_current_sheet()
                     placed = False
                     if piece.shape == "rectangular":
-                        pos = current_sheet.try_place_rectangular(int(piece.width), int(piece.height), int(piece.section), int(self.margin))
+                        pos = current_sheet.try_place_rectangular(int(piece.width), int(piece.height),
+                                                                  int(piece.section), int(self.margin))
                         orientation = "normal"
                         if pos is None and piece.rotatable:
-                            pos = current_sheet.try_place_rectangular(int(piece.height), int(piece.width), int(piece.section), int(self.margin))
+                            pos = current_sheet.try_place_rectangular(int(piece.height), int(piece.width),
+                                                                      int(piece.section), int(self.margin))
                             orientation = "rotated" if pos is not None else None
+
                         if pos is not None:
                             self.positions.append({
                                 "sheet": len(self.sheets),
@@ -179,7 +203,8 @@ class CutOptimizer:
                             self.total_pieces += 1
                             placed = True
                             logging.info(f"Peça retangular (max_mode) posicionada na chapa {len(self.sheets)} em {pos} com orientação {orientation}")
-                    elif piece.shape == "circular":
+                    else:
+                        # Circular
                         pos = current_sheet.try_place_circular(int(piece.diameter), piece.inner_diameter, int(self.margin))
                         if pos is not None:
                             self.positions.append({
@@ -194,23 +219,29 @@ class CutOptimizer:
                             self.total_pieces += 1
                             placed = True
                             logging.info(f"Peça circular (max_mode) posicionada na chapa {len(self.sheets)} em {pos}")
+
                     if not placed:
                         # Se não couber mais na chapa atual, encerra max_mode (não cria nova chapa para max_mode)
                         break
                     progress += 1
                     if progress_callback:
                         progress_callback(min(progress / total_count, 1.0))
+
             else:
+                # Modo "normal": respeita a quantidade de peças
                 for _ in range(piece.quantity):
                     placed = False
                     while not placed:
                         current_sheet = self._get_current_sheet()
                         if piece.shape == "rectangular":
-                            pos = current_sheet.try_place_rectangular(int(piece.width), int(piece.height), int(piece.section), int(self.margin))
+                            pos = current_sheet.try_place_rectangular(int(piece.width), int(piece.height),
+                                                                      int(piece.section), int(self.margin))
                             orientation = "normal"
                             if pos is None and piece.rotatable:
-                                pos = current_sheet.try_place_rectangular(int(piece.height), int(piece.width), int(piece.section), int(self.margin))
+                                pos = current_sheet.try_place_rectangular(int(piece.height), int(piece.width),
+                                                                          int(piece.section), int(self.margin))
                                 orientation = "rotated" if pos is not None else None
+
                             if pos is not None:
                                 self.positions.append({
                                     "sheet": len(self.sheets),
@@ -226,8 +257,11 @@ class CutOptimizer:
                                 placed = True
                                 logging.info(f"Peça retangular posicionada na chapa {len(self.sheets)} em {pos} com orientação {orientation}")
                             else:
+                                # Se não couber, cria nova chapa
                                 self._add_new_sheet()
-                        elif piece.shape == "circular":
+
+                        else:
+                            # Circular
                             pos = current_sheet.try_place_circular(int(piece.diameter), piece.inner_diameter, int(self.margin))
                             if pos is not None:
                                 self.positions.append({
@@ -243,10 +277,13 @@ class CutOptimizer:
                                 placed = True
                                 logging.info(f"Peça circular posicionada na chapa {len(self.sheets)} em {pos}")
                             else:
+                                # Se não couber, cria nova chapa
                                 self._add_new_sheet()
+
                     progress += 1
                     if progress_callback:
                         progress_callback(min(progress / total_count, 1.0))
+
         return self.positions, self.total_pieces, len(self.sheets)
 
 # =============================================================================
@@ -274,7 +311,7 @@ def plot_layout(sheet_width: float, sheet_length: float, positions: list, total_
                     x, y = pos["x"], pos["y"]
                     w = pos["width"]
                     h = pos["height"]
-                    extra = pos["section"]
+                    extra = pos.get("section", 0)
                     if extra > 0 and (2 * extra < w) and (2 * extra < h):
                         rect_outer = plt.Rectangle((x, y), w, h, edgecolor='blue', facecolor='cyan', linewidth=1)
                         ax.add_patch(rect_outer)
@@ -290,7 +327,7 @@ def plot_layout(sheet_width: float, sheet_length: float, positions: list, total_
                     center = (x + d / 2, y + d / 2)
                     circle = plt.Circle(center, d / 2, edgecolor='green', facecolor='lightgreen', linewidth=1)
                     ax.add_patch(circle)
-                    if pos["inner_diameter"] > 0 and pos["inner_diameter"] < d:
+                    if pos.get("inner_diameter", 0) > 0 and pos["inner_diameter"] < d:
                         inner_circle = plt.Circle(center, pos["inner_diameter"] / 2,
                                                   edgecolor='red', facecolor='none', linestyle='dashed', linewidth=1)
                         ax.add_patch(inner_circle)
@@ -407,7 +444,7 @@ def main():
                 df.columns = df.columns.str.strip()
                 df.fillna("", inplace=True)
 
-                # Colunas que esperamos encontrar, baseadas no DataFrame que o próprio app gera
+                # Colunas que esperamos encontrar
                 required_cols = {"shape", "width", "height", "section", "diameter", "inner_diameter", "quantity", "rotatable", "max_mode"}
                 if not required_cols.issubset(set(df.columns)):
                     st.sidebar.error(
@@ -415,10 +452,8 @@ def main():
                         f"Colunas encontradas: {', '.join(df.columns)}"
                     )
                 else:
-                    # Limpa lista de peças antes de importar
                     st.session_state["pieces"] = []
                     for idx, row in df.iterrows():
-                        # Lê valores da linha, com fallback para 0 ou False se vazio
                         shape = str(row.get("shape", "")).strip().lower()
                         quantity = int(row.get("quantity", 1) or 1)
                         rotatable = bool(row.get("rotatable", True))
@@ -438,6 +473,7 @@ def main():
                                 max_mode=max_mode
                             )
                             st.session_state["pieces"].append(new_piece)
+
                         elif shape == "circular":
                             d_val = float(row.get("diameter", 0) or 0)
                             i_val = float(row.get("inner_diameter", 0) or 0)
@@ -505,4 +541,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
