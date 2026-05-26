@@ -115,32 +115,46 @@ class SkylinePacker:
 class CircularLayout:
     """
     Mantém uma matriz bitmap para posicionamento de peças circulares.
-    Toda a verificação e marcação é 100% vetorizada com NumPy.
+    Verificação e marcação 100% vetorizadas com NumPy.
+
+    ESTRATÉGIA DE CANDIDATOS PRÉ-CALCULADOS
+    ─────────────────────────────────────────
+    Para cada (diâmetro, margem), a lista de posições candidatas é calculada
+    UMA ÚNICA VEZ (hexagonal ou cartesiana) e reutilizada em todas as
+    chamadas subsequentes. Quando a lista se esgota → retorna None imediatamente,
+    sem nenhum fallback de varredura pixel a pixel.
+
+    Isso elimina o gargalo principal: o fallback O(W×H) que era executado
+    mesmo com a chapa já totalmente ocupada (ex.: 2.2M iterações para
+    DE=355 em chapa 1200×3000).
     """
+
     def __init__(self, width: int, height: int):
         self.width = width
         self.height = height
         self.layout = np.zeros((height, width), dtype=np.int8)
+        # Cache de candidatos por chave (diameter, inner_diameter, margin, hexagonal)
+        self._candidates_cache: dict = {}
+        self._candidate_idx: dict = {}  # ponteiro atual por chave
 
-        # Pré-calcula o hexagonal grid offsets para hexagonal packing
-        # Não é obrigatório, mas acelera a busca com step hexagonal
+    # ── Máscara booleana ──────────────────────────────────────────────────────
+    def _circle_mask(self, diameter: int, inner_diameter: float) -> np.ndarray:
+        """Máscara booleana da peça circular, pré-calculada e cacheada."""
+        key = (diameter, inner_diameter)
+        if not hasattr(self, '_mask_cache'):
+            self._mask_cache = {}
+        if key not in self._mask_cache:
+            r_ext = diameter / 2.0
+            r_int = inner_diameter / 2.0
+            idx = np.indices((diameter, diameter), dtype=np.float32)
+            dist = np.hypot(idx[0] + 0.5 - r_ext, idx[1] + 0.5 - r_ext)
+            self._mask_cache[key] = (dist <= r_ext) & (dist >= r_int) if r_int > 0 else dist <= r_ext
+        return self._mask_cache[key]
 
-    def _circle_mask(self, diameter: int, inner_diameter: float):
-        """Retorna a máscara booleana de uma peça circular centrada na bounding box."""
-        r_ext = diameter / 2.0
-        r_int = inner_diameter / 2.0
-        idx = np.indices((diameter, diameter), dtype=np.float32)
-        dist = np.hypot(idx[0] + 0.5 - r_ext, idx[1] + 0.5 - r_ext)
-        if r_int > 0:
-            return (dist <= r_ext) & (dist >= r_int)
-        return dist <= r_ext
-
-    def check_and_mark(self, x: int, y: int, diameter: int,
-                       inner_diameter: float, mask: np.ndarray) -> bool:
-        """
-        Verifica se a peça cabe em (x,y) e a marca no layout.
-        Recebe a máscara pré-calculada para evitar recomputação.
-        """
+    # ── Verificação e marcação vetorizadas ───────────────────────────────────
+    def _check_and_mark(self, x: int, y: int, diameter: int,
+                        mask: np.ndarray) -> bool:
+        """Verifica colisão e marca a posição vetorialmente. O(pixels_da_peça)."""
         if x + diameter > self.width or y + diameter > self.height:
             return False
         region = self.layout[y:y + diameter, x:x + diameter]
@@ -149,58 +163,77 @@ class CircularLayout:
         region[mask] = 1
         return True
 
-    def try_place_hexagonal(self, diameter: int, inner_diameter: float,
-                            margin: int) -> Optional[tuple]:
+    # ── Geração de candidatos ─────────────────────────────────────────────────
+    def _build_candidates_hexagonal(self, diameter: int, margin: int) -> list:
         """
-        Posicionamento hexagonal (offset em linhas alternadas).
-        Aproveitamento teórico ~90.7% vs ~78.5% do grid cartesiano.
+        Gera TODAS as posições candidatas em grid hexagonal.
+        Chamado apenas uma vez por (diameter, margin) por chapa.
         """
-        mask = self._circle_mask(diameter, inner_diameter)
         step_x = diameter + margin
-        step_y_base = diameter + margin
-        # Para hexagonal packing real: distância entre centros = diâmetro
-        # Deslocamento vertical = diâmetro × √3/2
-        step_y = max(1, int(step_y_base * 0.866))  # √3/2 ≈ 0.866
-
+        step_y = max(1, int((diameter + margin) * 0.866))  # √3/2
+        candidates = []
         row = 0
         y = 0
         while y + diameter <= self.height:
             x_offset = (diameter // 2 + margin // 2) if (row % 2 == 1) else 0
             x = x_offset
             while x + diameter <= self.width:
-                if self.check_and_mark(x, y, diameter, inner_diameter, mask):
-                    return (x, y)
+                candidates.append((x, y))
                 x += step_x
             y += step_y
             row += 1
+        return candidates
 
-        # Fallback: varredura completa linha a linha
-        for y in range(0, self.height - diameter + 1):
-            for x in range(0, self.width - diameter + 1):
-                if self.check_and_mark(x, y, diameter, inner_diameter, mask):
-                    return (x, y)
-        return None
-
-    def try_place_next(self, diameter: int, inner_diameter: float,
-                       margin: int) -> Optional[tuple]:
-        """
-        Encontra a próxima posição livre (busca completa).
-        Usa passo heurístico primeiro, depois busca fina se necessário.
-        """
-        mask = self._circle_mask(diameter, inner_diameter)
-
-        # Passo heurístico rápido
-        step = max(1, int(diameter * 0.25 + margin))
+    def _build_candidates_cartesian(self, diameter: int, margin: int) -> list:
+        """Grid cartesiano simples — fallback quando hexagonal não é solicitado."""
+        step = diameter + margin
+        candidates = []
         for y in range(0, self.height - diameter + 1, step):
             for x in range(0, self.width - diameter + 1, step):
-                if self.check_and_mark(x, y, diameter, inner_diameter, mask):
-                    return (x, y)
+                candidates.append((x, y))
+        return candidates
 
-        # Busca fina completa
-        for y in range(0, self.height - diameter + 1):
-            for x in range(0, self.width - diameter + 1):
-                if self.check_and_mark(x, y, diameter, inner_diameter, mask):
-                    return (x, y)
+    def _get_candidates(self, diameter: int, inner_diameter: float,
+                        margin: int, hexagonal: bool) -> tuple:
+        """
+        Retorna (candidates_list, cache_key).
+        Na primeira chamada gera a lista; nas seguintes reutiliza do cache.
+        """
+        key = (diameter, inner_diameter, margin, hexagonal)
+        if key not in self._candidates_cache:
+            if hexagonal:
+                cands = self._build_candidates_hexagonal(diameter, margin)
+            else:
+                cands = self._build_candidates_cartesian(diameter, margin)
+            self._candidates_cache[key] = cands
+            self._candidate_idx[key] = 0
+            logging.debug(f"Candidatos gerados: {len(cands)} para d={diameter}, hex={hexagonal}")
+        return self._candidates_cache[key], key
+
+    # ── Método principal de posicionamento ───────────────────────────────────
+    def try_place(self, diameter: int, inner_diameter: float,
+                  margin: int, hexagonal: bool = True) -> Optional[tuple]:
+        """
+        Tenta posicionar a próxima peça circular na chapa.
+
+        Itera pelos candidatos pré-calculados A PARTIR DO ÚLTIMO ÍNDICE SALVO
+        (não recomeça do zero a cada chamada). Quando esgota a lista → None,
+        sem nenhuma varredura pixel a pixel adicional.
+
+        Retorna (x, y) ou None.
+        """
+        mask = self._circle_mask(diameter, inner_diameter)
+        candidates, key = self._get_candidates(diameter, inner_diameter, margin, hexagonal)
+        idx = self._candidate_idx[key]
+
+        while idx < len(candidates):
+            x, y = candidates[idx]
+            idx += 1
+            if self._check_and_mark(x, y, diameter, mask):
+                self._candidate_idx[key] = idx  # salva ponteiro para próxima chamada
+                return (x, y)
+
+        self._candidate_idx[key] = idx  # chegou ao fim
         return None
 
 
@@ -250,11 +283,7 @@ class CutOptimizer:
     def _place_circular(self, piece: Piece, sheet_idx: int) -> Optional[tuple]:
         cl = self._circ_layouts[sheet_idx]
         d, di = int(piece.diameter), piece.inner_diameter
-        if self.use_hexagonal:
-            pos = cl.try_place_hexagonal(d, di, self.margin)
-        else:
-            pos = cl.try_place_next(d, di, self.margin)
-        return pos
+        return cl.try_place(d, di, self.margin, hexagonal=self.use_hexagonal)
 
     def optimize(self, pieces: list, progress_callback=None):
         # ── Separar max_mode das normais ──
@@ -272,11 +301,32 @@ class CutOptimizer:
 
         total_ops = len(expanded) + len(maxmode_pieces)
         done = 0
+        MAX_SHEETS = 50  # teto de segurança — evita loop infinito
+
+        # ── Validar peças antes de começar ──
+        skipped = []
+        valid_expanded = []
+        for piece in expanded:
+            if piece.shape == "rectangular":
+                fits = (piece.width <= self.sheet_width and piece.height <= self.sheet_length) or \
+                       (piece.rotatable and piece.height <= self.sheet_width and piece.width <= self.sheet_length)
+            else:
+                fits = piece.diameter <= self.sheet_width and piece.diameter <= self.sheet_length
+            if fits:
+                valid_expanded.append(piece)
+            else:
+                skipped.append(piece)
+                logging.warning(f"Peça ignorada — não cabe na chapa: {piece}")
+
+        if skipped:
+            logging.warning(f"{len(skipped)} peça(s) ignorada(s) por serem maiores que a chapa.")
 
         # ── Alocar peças normais ──
-        for piece in expanded:
+        for piece in valid_expanded:
             placed = False
-            while not placed:
+            attempts = 0
+            while not placed and self.n_sheets <= MAX_SHEETS:
+                attempts += 1
                 idx = self.n_sheets - 1
                 if piece.shape == "rectangular":
                     result = self._place_rectangular(piece, idx)
@@ -311,12 +361,26 @@ class CutOptimizer:
                     else:
                         self._init_new_sheet()
 
+            if not placed:
+                logging.warning(f"Peça não alocada após {MAX_SHEETS} chapas — ignorada.")
+
             done += 1
             if progress_callback:
                 progress_callback(min(done / total_ops, 1.0))
 
         # ── Alocar peças max_mode (preenche chapa atual até esgotar) ──
         for piece in maxmode_pieces:
+            # Valida antes de entrar no loop
+            if piece.shape == "rectangular":
+                fits = (piece.width <= self.sheet_width and piece.height <= self.sheet_length) or \
+                       (piece.rotatable and piece.height <= self.sheet_width and piece.width <= self.sheet_length)
+            else:
+                fits = piece.diameter <= self.sheet_width and piece.diameter <= self.sheet_length
+            if not fits:
+                logging.warning(f"Peça max_mode ignorada — não cabe na chapa: {piece}")
+                done += 1
+                continue
+
             idx = self.n_sheets - 1
             while True:
                 placed = False
